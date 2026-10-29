@@ -66,6 +66,9 @@ jobs:
             image: i386/debian:bookworm
             platform: 386
             buildsys: debian
+            # DNS fails inside this container on ubuntu-26.04
+            # (ubuntu-latest since late October 2026).
+            runner: ubuntu-24.04
           - tl_name: x86_64-linuxmusl
             image: alpine:3.22
             platform: amd64
@@ -216,11 +219,23 @@ jobs:
         # An absolute configure path makes srcdir absolute, so MSYS2
         # converts path lists like WEBINPUTS=.:$(srcdir) correctly
         # (msys2/msys2-runtime#208; MSYS2's package patches the
-        # Makefiles instead).
+        # Makefiles instead). make -k runs every test suite even
+        # though kpathsea's has a known failure on trunk: kpsesafe.test
+        # expects the dotfile rule, which kpathsea applies only off
+        # Windows. Fail on anything else, or if a suite didn't run.
         run: |
           cd repo
           export TL_CONFIGURE="$PWD/configure"
-          sh .github/scripts/build-tl.sh x86_64-w64-mingw32 msys2 no-prepare
+          export TL_MAKE_VERBOSE="VERBOSE=1 -k"
+          sh .github/scripts/build-tl.sh x86_64-w64-mingw32 msys2 no-prepare || true
+          for d in kpathsea web2c; do
+            test -f Work/texk/$d/test-suite.log || { echo "$d tests did not run" >&2; exit 1; }
+          done
+          if grep -h '^\(FAIL\|ERROR\|XPASS\):' Work/libs/*/test-suite.log Work/texk/*/test-suite.log \
+             | grep -v '^FAIL: tests/kpsesafe$'; then
+            echo "unexpected test failures (above)" >&2
+            exit 1
+          fi
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v7
