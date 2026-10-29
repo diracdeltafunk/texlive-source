@@ -1,0 +1,232 @@
+# .github/workflows/fork-ci.yml for diracdeltafunk/texlive-source.
+#
+# Builds and tests any branch of this fork on the platforms we can't
+# test locally, before it goes upstream as a PR. Only manual dispatch:
+#
+#   gh workflow run fork-ci.yml -R diracdeltafunk/texlive-source \
+#     -f ref=pdftex-pdfobj-file [-f scope=full] [-f big_endian=true]
+#
+# This file lives on the orphan branch fork-ci (the fork's default
+# branch, which workflow_dispatch requires), so it never appears in a
+# branch that we propose upstream. The jobs check out inputs.ref and
+# run that ref's own .github/scripts/build-tl.sh, the script upstream's
+# main.yml uses, so Linux and FreeBSD builds match TeX Live's CI.
+# build-tl.sh runs ./Build, and Build runs `make check`.
+
+name: Fork CI
+run-name: Test ${{ inputs.ref }} (${{ inputs.scope }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to test
+        required: true
+      scope:
+        description: pdftex = kpathsea + TeX/e-TeX/pdfTeX only; full = everything ./Build builds
+        type: choice
+        options: [pdftex, full]
+        default: pdftex
+      big_endian:
+        description: Also test on s390x under QEMU (slow; always pdftex scope)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ inputs.ref }}-${{ inputs.scope }}
+  cancel-in-progress: true
+
+env:
+  # The configuration of ~/tex-perf/texlive-source/Work-pdftex.
+  PDFTEX_CONFIGURE_ARGS: >-
+    --disable-all-pkgs --enable-web2c --enable-pdftex --enable-tex
+    --enable-etex --disable-xetex --disable-luatex --disable-luajittex
+    --disable-luahbtex --disable-luajithbtex --disable-mflua
+    --disable-mfluajit --disable-mf --disable-aleph --disable-ptex
+    --disable-eptex --disable-uptex --disable-euptex --disable-hitex
+    --disable-mp --disable-pmp --disable-upmp --without-x
+
+jobs:
+  linux:
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
+    name: ${{ matrix.tl_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same images as upstream's main.yml.
+        include:
+          - tl_name: x86_64-linux
+            image: almalinux:8
+            platform: amd64
+            buildsys: almalinux
+          - tl_name: i386-linux
+            image: i386/debian:bookworm
+            platform: 386
+            buildsys: debian
+          - tl_name: x86_64-linuxmusl
+            image: alpine:3.22
+            platform: amd64
+            buildsys: alpine
+          - tl_name: aarch64-linux
+            image: arm64v8/debian:bookworm
+            platform: aarch64
+            buildsys: debian
+            runner: ubuntu-24.04-arm
+          - tl_name: armhf-linux
+            image: arm32v7/debian:bookworm
+            platform: arm/v7
+            buildsys: debian
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          path: repo
+      - name: Build and test
+        env:
+          TL_CONFIGURE_ARGS: ${{ inputs.scope == 'pdftex' && env.PDFTEX_CONFIGURE_ARGS || '' }}
+        run: |
+          docker run --rm -e TL_CONFIGURE_ARGS -v "$GITHUB_WORKSPACE:/work" \
+            --platform linux/${{ matrix.platform }} ${{ matrix.image }} \
+            sh -c "cd /work/repo && .github/scripts/build-tl.sh ${{ matrix.tl_name }} ${{ matrix.buildsys }}"
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ matrix.tl_name }}
+          path: |
+            repo/Work/*.log
+            repo/Work/**/*.log
+          if-no-files-found: ignore
+
+  big-endian:
+    if: inputs.big_endian
+    runs-on: ubuntu-latest
+    name: s390x-linux (QEMU)
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          path: repo
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: s390x
+      - name: Build and test
+        env:
+          TL_CONFIGURE_ARGS: ${{ env.PDFTEX_CONFIGURE_ARGS }}
+        run: |
+          docker run --rm -e TL_CONFIGURE_ARGS -v "$GITHUB_WORKSPACE:/work" \
+            --platform linux/s390x s390x/debian:bookworm \
+            sh -c "cd /work/repo && .github/scripts/build-tl.sh s390x-linux debian"
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-s390x-linux
+          path: |
+            repo/Work/*.log
+            repo/Work/**/*.log
+          if-no-files-found: ignore
+
+  freebsd:
+    runs-on: ubuntu-latest
+    name: amd64-freebsd
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          path: repo
+      - name: Build and test
+        uses: vmactions/freebsd-vm@v1
+        env:
+          TL_CONFIGURE_ARGS: ${{ inputs.scope == 'pdftex' && env.PDFTEX_CONFIGURE_ARGS || '' }}
+        with:
+          release: '14.4'
+          envs: TL_CONFIGURE_ARGS
+          usesh: true
+          run: |
+            cd repo
+            sh .github/scripts/build-tl.sh amd64-freebsd freebsd
+
+  macos:
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.tl_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tl_name: arm64-darwin
+            runner: macos-latest
+          - tl_name: x86_64-darwin
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          path: repo
+      - name: Build and test
+        env:
+          TL_CONFIGURE_ARGS: ${{ inputs.scope == 'pdftex' && env.PDFTEX_CONFIGURE_ARGS || '' }}
+        # build-tl.sh has no macOS package setup; Xcode's tools suffice.
+        run: |
+          cd repo
+          sh .github/scripts/build-tl.sh ${{ matrix.tl_name }} macos no-prepare
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ matrix.tl_name }}
+          path: |
+            repo/Work/*.log
+            repo/Work/**/*.log
+          if-no-files-found: ignore
+
+  # Native MinGW-w64 build under MSYS2, as MSYS2's own texlive-bin
+  # package does. Always pdftex scope: that covers kpathsea's and
+  # web2c's WIN32 code, which is what our patches touch.
+  windows:
+    runs-on: windows-latest
+    name: x86_64-w64-mingw32 (MSYS2)
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      # Keep LF line endings, or the shell scripts break.
+      - run: git config --global core.autocrlf false
+        shell: pwsh
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          path: repo
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: make perl diffutils
+          pacboy: gcc:p
+      - name: Build and test
+        env:
+          TL_CONFIGURE_ARGS: ${{ env.PDFTEX_CONFIGURE_ARGS }}
+          # From MSYS2's mingw-w64-texlive-bin PKGBUILD.
+          CFLAGS: -std=gnu17 -Wno-incompatible-pointer-types
+        # An absolute configure path makes srcdir absolute, so MSYS2
+        # converts path lists like WEBINPUTS=.:$(srcdir) correctly
+        # (msys2/msys2-runtime#208; MSYS2's package patches the
+        # Makefiles instead).
+        run: |
+          cd repo
+          export TL_CONFIGURE="$PWD/configure"
+          sh .github/scripts/build-tl.sh x86_64-w64-mingw32 msys2 no-prepare
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-x86_64-w64-mingw32
+          path: |
+            repo/Work/*.log
+            repo/Work/**/*.log
+          if-no-files-found: ignore
